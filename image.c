@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <string.h>
+#include <pthread.h>
 #include "image.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -9,6 +10,9 @@
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
+
+
+#define NUM_THREADS 64
 
 //An array of kernel matrices to be used for image convolution.  
 //The indexes of these match the enumeration from the header file. ie. algorithms[BLUR] returns the kernel corresponding to a box blur.
@@ -21,6 +25,19 @@ Matrix algorithms[]={
     {{0,0,0},{0,1,0},{0,0,0}}
 };
 
+// This is the lock that is used for modifying the image's data
+pthread_mutex_t image_lock;
+
+// The original image that will be modified
+Image srcImage;
+
+// The image that is going to be written
+Image destImage;
+
+// The algorithm that will be used for image modification
+Matrix algorithm;
+
+
 
 //getPixelValue - Computes the value of a specific pixel on a specific channel using the selected convolution kernel
 //Paramters: srcImage:  An Image struct populated with the image being convoluted
@@ -29,9 +46,9 @@ Matrix algorithms[]={
 //          bit: The color channel being manipulated
 //          algorithm: The 3x3 kernel matrix to use for the convolution
 //Returns: The new value for this x,y pixel and bit channel
-uint8_t getPixelValue(Image* srcImage,int x,int y,int bit,Matrix algorithm){
+
+uint8_t getPixelValue(Image* srcImage,int x,int y,int bit){
     int px,mx,py,my,i,span;
-    span=srcImage->width*srcImage->bpp;
     // for the edge pixes, just reuse the edge pixel
     px=x+1; py=y+1; mx=x-1; my=y-1;
     if (mx<0) mx=0;
@@ -51,21 +68,65 @@ uint8_t getPixelValue(Image* srcImage,int x,int y,int bit,Matrix algorithm){
     return result;
 }
 
+
 //convolute:  Applies a kernel matrix to an image
 //Parameters: srcImage: The image being convoluted
-//            destImage: A pointer to a  pre-allocated (including space for the pixel array) structure to receive the convoluted image.  It should be the same size as srcImage
+//            destImage: A pointer to a  pre-allocated (including space for the pixel array) structure to receive the convoluted image. It should be the same size as srcImage
 //            algorithm: The kernel matrix to use for the convolution
 //Returns: Nothing
-void convolute(Image* srcImage,Image* destImage,Matrix algorithm){
-    int row,pix,bit,span;
-    span=srcImage->bpp*srcImage->bpp;
-    for (row=0;row<srcImage->height;row++){
-        for (pix=0;pix<srcImage->width;pix++){
-            for (bit=0;bit<srcImage->bpp;bit++){
-                destImage->data[Index(pix,row,srcImage->width,bit,srcImage->bpp)]=getPixelValue(srcImage,pix,row,bit,algorithm);
+void *convolute(void *rank){
+    int row; 
+    int end_row; 
+    int pix; 
+    int bit; 
+    int span;
+    int ind;
+    uint8_t pvalue;
+    long my_rank = (long) rank;
+
+    int inc = srcImage.height / NUM_THREADS;
+    row = my_rank * inc;
+    end_row = row + inc - 1;
+
+    for (; row <= end_row; row++){
+        for (pix=0;pix<srcImage.width;pix++){
+            for (bit=0;bit<srcImage.bpp;bit++){
+                ind = Index(pix,row,srcImage.width,bit,srcImage.bpp);
+                pvalue = getPixelValue(&srcImage,pix,row,bit);
+                destImage.data[ind] = pvalue;
             }
         }
     }
+    
+    return 0;
+}
+
+/*
+    Function: threadedConvolute that creates threads to apply a kernel matrix to an image in parallel
+    Parameters: srcImage: The image being convoluted
+                destImage: A pointer to a pre-allocated (including space for the pixel array) structure to receive the convoluted image. It should be the same size as srcImage
+                algorithm: The kernel matrix to use for the convolution
+                numThreads: The number of threads to spawn for the work
+*/
+void threadedConvolute() {
+    int row, pix, bit, span;
+    long i;
+    uint8_t pvalue;
+    pthread_t threads[NUM_THREADS];
+    pthread_mutex_init(&image_lock, NULL);
+
+    for (i = 0; i < NUM_THREADS; i++) {
+        //create the new thread 
+        //thread id, attributes for the thread, pointer to convolute function to be executed, pointer to a void value that can be used to pass arguments to the function being executed
+        pthread_create(&threads[i], NULL, &convolute, (void *)i);
+    }
+
+    for (i = 0; i < NUM_THREADS; i++) {
+        //waits for the threads created above to finish executing before continuing
+        pthread_join(threads[i], NULL);
+    }
+    //destroy the mutex object &image_lock
+    pthread_mutex_destroy(&image_lock);
 }
 
 //Usage: Prints usage information for the program
@@ -101,7 +162,6 @@ int main(int argc,char** argv){
     }
     enum KernelTypes type=GetKernelType(argv[2]);
 
-    Image srcImage,destImage,bwImage;   
     srcImage.data=stbi_load(fileName,&srcImage.width,&srcImage.height,&srcImage.bpp,0);
     if (!srcImage.data){
         printf("Error loading file %s.\n",fileName);
@@ -111,7 +171,8 @@ int main(int argc,char** argv){
     destImage.height=srcImage.height;
     destImage.width=srcImage.width;
     destImage.data=malloc(sizeof(uint8_t)*destImage.width*destImage.bpp*destImage.height);
-    convolute(&srcImage,&destImage,algorithms[type]);
+    memcpy(algorithm, algorithms[type], sizeof(Matrix));
+    threadedConvolute();
     stbi_write_png("output.png",destImage.width,destImage.height,destImage.bpp,destImage.data,destImage.bpp*destImage.width);
     stbi_image_free(srcImage.data);
     
